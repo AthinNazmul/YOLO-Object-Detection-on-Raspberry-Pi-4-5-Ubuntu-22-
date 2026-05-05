@@ -155,123 +155,58 @@ Save as `~/yolo/webcam_detect.py`:
 ```python
 """
 YOLO Live Detection — USB Webcam
-Works on Raspberry Pi 4/5 (Raspberry Pi OS or Ubuntu with Xorg)
-
-Requirements:
-  - Ubuntu: must be on Xorg, not Wayland (select "Ubuntu on Xorg" at login)
-  - OpenCV: install via apt, not pip
-      pip uninstall opencv-python opencv-python-headless -y
-      sudo apt install -y python3-opencv
+Raspberry Pi 4/5 — Raspberry Pi OS or Ubuntu (Xorg/X11)
 
 Usage:
   python webcam_detect.py --model yolo11n_ncnn_model --camera 0
   python webcam_detect.py --model yolo11n_ncnn_model --camera 0 --width 640 --height 480
+  python webcam_detect.py --model yolo11n_ncnn_model --camera 0 --conf 0.4
 """
 
 import cv2
 from ultralytics import YOLO
-import threading
 import time
 import argparse
-import os
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="YOLO USB webcam detection")
-    parser.add_argument("--model",  type=str, default="yolo11n_ncnn_model",
-                        help="Path to NCNN model folder (or .pt file)")
-    parser.add_argument("--camera", type=int, default=0,
-                        help="Camera index (0 = /dev/video0)")
-    parser.add_argument("--width",  type=int, default=640,
-                        help="Capture width")
-    parser.add_argument("--height", type=int, default=480,
-                        help="Capture height")
-    parser.add_argument("--conf",   type=float, default=0.25,
-                        help="Confidence threshold (default: 0.25)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",  type=str,   default="yolo11n_ncnn_model")
+    parser.add_argument("--camera", type=int,   default=0)
+    parser.add_argument("--width",  type=int,   default=640)
+    parser.add_argument("--height", type=int,   default=480)
+    parser.add_argument("--conf",   type=float, default=0.25)
     return parser.parse_args()
 
+args = parse_args()
 
-args    = parse_args()
-model   = YOLO(args.model, task="detect")
-lock    = threading.Lock()
-running = True
-frame_  = None
-
-
-def camGrabber(cam_index, w, h):
-    """
-    Background thread — reads frames from the USB webcam continuously.
-    Separating this from the main thread prevents cap.read() from
-    blocking cv2.waitKey(), which causes the black frozen window.
-    """
-    global frame_, running
-    cap = cv2.VideoCapture(cam_index)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # always get the latest frame
-
-    if not cap.isOpened():
-        print(f"[ERROR] Cannot open camera index {cam_index}.")
-        print(f"        Run: ls /dev/video*  to see available cameras")
-        print(f"        Try --camera 1 or --camera 2 if 0 doesn't work")
-        running = False
-        return
-
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[INFO] Camera opened at {actual_w}x{actual_h}")
-
-    while running:
-        ret, frame = cap.read()
-        if ret:
-            with lock:
-                frame_ = frame.copy()
-        else:
-            time.sleep(0.01)
-    cap.release()
-    print("[INFO] Camera thread stopped.")
-
-
-# Start background camera thread
-thread = threading.Thread(
-    target=camGrabber,
-    args=(args.camera, args.width, args.height),
-    daemon=True
-)
-thread.start()
-
+# Load model
 print(f"[INFO] Loading model: {args.model}")
-print(f"[INFO] Opening camera {args.camera} at {args.width}x{args.height}")
-time.sleep(2)   # give camera time to initialise
+model = YOLO(args.model, task="detect")
 
-if not running or frame_ is None:
-    print("[ERROR] No frames from camera. Check connection and camera index.")
-    running = False
+# Open camera
+print(f"[INFO] Opening camera {args.camera} at {args.width}x{args.height}")
+cap = cv2.VideoCapture(args.camera)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
+if not cap.isOpened():
+    print(f"[ERROR] Cannot open camera {args.camera}")
+    print(f"        Run: ls /dev/video*  to see available cameras")
     exit(1)
 
-print("[INFO] Detection started. Press Q to quit, S to save screenshot.")
+print("[INFO] Press Q to quit, S to save screenshot.")
 
-fps        = 0
-annotated  = None
-prev_frame = None
+fps = 0
 
 while True:
-    # Get latest frame from thread
-    with lock:
-        if frame_ is None:
-            time.sleep(0.01)
-            continue
-        frame = frame_.copy()
-
-    # Skip if identical to last frame (camera not ready yet)
-    if prev_frame is not None and cv2.norm(frame, prev_frame) < 1.0:
-        if annotated is not None:
-            cv2.imshow("YOLO Webcam — Q quit  S save", annotated)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    ret, frame = cap.read()
+    if not ret:
+        print("[WARN] Failed to read frame, retrying...")
+        time.sleep(0.1)
         continue
-    prev_frame = frame.copy()
 
-    # Inference
+    # Run inference
     t0      = time.time()
     results = model(frame, conf=args.conf, verbose=False)[0]
     inf_ms  = (time.time() - t0) * 1000
@@ -283,15 +218,14 @@ while True:
     annotated = results.plot()
 
     # Overlay stats
-    n_det = len(results.boxes)
     cv2.putText(annotated, f"FPS: {fps:.1f}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-    cv2.putText(annotated, f"Objects: {n_det}",
+    cv2.putText(annotated, f"Objects: {len(results.boxes)}",
                 (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     cv2.putText(annotated, f"Inf: {inf_ms:.0f}ms",
                 (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
-    cv2.imshow("YOLO Webcam — Q quit  S save", annotated)
+    cv2.imshow("YOLO Webcam", annotated)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
@@ -299,14 +233,11 @@ while True:
     elif key == ord('s'):
         fname = f"webcam_{int(time.time())}.jpg"
         cv2.imwrite(fname, annotated)
-        print(f"[INFO] Screenshot saved: {fname}")
+        print(f"[INFO] Saved: {fname}")
 
-# Clean shutdown
-running = False
-thread.join(timeout=3)
+cap.release()
 cv2.destroyAllWindows()
-import gc; gc.collect()
-import os; os._exit(0)
+print(f"[INFO] Done. Final FPS: {fps:.1f}")
 ```
 
 **Run it:**
