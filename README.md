@@ -154,91 +154,159 @@ Save as `~/yolo/webcam_detect.py`:
 
 ```python
 """
-Live YOLO Object Detection — USB Webcam
-Works on Raspberry Pi 4/5 (Raspberry Pi OS or Ubuntu) and Ubuntu x86_64.
+YOLO Live Detection — USB Webcam
+Works on Raspberry Pi 4/5 (Raspberry Pi OS or Ubuntu with Xorg)
+
+Requirements:
+  - Ubuntu: must be on Xorg, not Wayland (select "Ubuntu on Xorg" at login)
+  - OpenCV: install via apt, not pip
+      pip uninstall opencv-python opencv-python-headless -y
+      sudo apt install -y python3-opencv
 
 Usage:
-    python webcam_detect.py --model yolo11n_ncnn_model --camera 0 --width 640 --height 480
+  python webcam_detect.py --model yolo11n_ncnn_model --camera 0
+  python webcam_detect.py --model yolo11n_ncnn_model --camera 0 --width 640 --height 480
 """
 
-import argparse
 import cv2
 from ultralytics import YOLO
+import threading
 import time
+import argparse
+import os
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Live YOLO webcam detection")
-    parser.add_argument("--model", type=str, default="yolo11n_ncnn_model",
+    parser = argparse.ArgumentParser(description="YOLO USB webcam detection")
+    parser.add_argument("--model",  type=str, default="yolo11n_ncnn_model",
                         help="Path to NCNN model folder (or .pt file)")
     parser.add_argument("--camera", type=int, default=0,
-                        help="Camera index (0 = /dev/video0, 1 = /dev/video1, etc.)")
-    parser.add_argument("--width", type=int, default=640,
-                        help="Capture width in pixels")
+                        help="Camera index (0 = /dev/video0)")
+    parser.add_argument("--width",  type=int, default=640,
+                        help="Capture width")
     parser.add_argument("--height", type=int, default=480,
-                        help="Capture height in pixels")
-    parser.add_argument("--conf", type=float, default=0.5,
-                        help="Confidence threshold (0.0 – 1.0)")
+                        help="Capture height")
+    parser.add_argument("--conf",   type=float, default=0.25,
+                        help="Confidence threshold (default: 0.25)")
     return parser.parse_args()
 
-def main():
-    args = parse_args()
 
-    # Load model
-    print(f"[INFO] Loading model: {args.model}")
-    model = YOLO(args.model, task="detect")
+args    = parse_args()
+model   = YOLO(args.model, task="detect")
+lock    = threading.Lock()
+running = True
+frame_  = None
 
-    # Open camera
-    print(f"[INFO] Opening camera index {args.camera} at {args.width}x{args.height}")
-    cap = cv2.VideoCapture(args.camera)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
+def camGrabber(cam_index, w, h):
+    """
+    Background thread — reads frames from the USB webcam continuously.
+    Separating this from the main thread prevents cap.read() from
+    blocking cv2.waitKey(), which causes the black frozen window.
+    """
+    global frame_, running
+    cap = cv2.VideoCapture(cam_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # always get the latest frame
 
     if not cap.isOpened():
-        print("[ERROR] Cannot open camera. Check the --camera index and that /dev/video* exists.")
+        print(f"[ERROR] Cannot open camera index {cam_index}.")
+        print(f"        Run: ls /dev/video*  to see available cameras")
+        print(f"        Try --camera 1 or --camera 2 if 0 doesn't work")
+        running = False
         return
 
-    print("[INFO] Press 'q' to quit, 's' to save a screenshot.")
-    fps_list = []
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[INFO] Camera opened at {actual_w}x{actual_h}")
 
-    while True:
+    while running:
         ret, frame = cap.read()
-        if not ret:
-            print("[ERROR] Failed to read frame. Camera may have disconnected.")
-            break
-
-        t_start = time.time()
-
-        # Run inference
-        results = model(frame, conf=args.conf, verbose=False)
-
-        # Draw detections
-        annotated = results[0].plot()
-
-        # Calculate and display FPS
-        elapsed = time.time() - t_start
-        fps = 1.0 / elapsed if elapsed > 0 else 0
-        fps_list.append(fps)
-        avg_fps = sum(fps_list[-30:]) / len(fps_list[-30:])
-
-        cv2.putText(annotated, f"FPS: {avg_fps:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-        cv2.imshow("YOLO Live Detection — press Q to quit", annotated)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('s'):
-            filename = f"screenshot_{int(time.time())}.jpg"
-            cv2.imwrite(filename, annotated)
-            print(f"[INFO] Screenshot saved: {filename}")
-
+        if ret:
+            with lock:
+                frame_ = frame.copy()
+        else:
+            time.sleep(0.01)
     cap.release()
-    cv2.destroyAllWindows()
-    print(f"[INFO] Average FPS over session: {sum(fps_list)/len(fps_list):.1f}")
+    print("[INFO] Camera thread stopped.")
 
-if __name__ == "__main__":
-    main()
+
+# Start background camera thread
+thread = threading.Thread(
+    target=camGrabber,
+    args=(args.camera, args.width, args.height),
+    daemon=True
+)
+thread.start()
+
+print(f"[INFO] Loading model: {args.model}")
+print(f"[INFO] Opening camera {args.camera} at {args.width}x{args.height}")
+time.sleep(2)   # give camera time to initialise
+
+if not running or frame_ is None:
+    print("[ERROR] No frames from camera. Check connection and camera index.")
+    running = False
+    exit(1)
+
+print("[INFO] Detection started. Press Q to quit, S to save screenshot.")
+
+fps        = 0
+annotated  = None
+prev_frame = None
+
+while True:
+    # Get latest frame from thread
+    with lock:
+        if frame_ is None:
+            time.sleep(0.01)
+            continue
+        frame = frame_.copy()
+
+    # Skip if identical to last frame (camera not ready yet)
+    if prev_frame is not None and cv2.norm(frame, prev_frame) < 1.0:
+        if annotated is not None:
+            cv2.imshow("YOLO Webcam — Q quit  S save", annotated)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        continue
+    prev_frame = frame.copy()
+
+    # Inference
+    t0      = time.time()
+    results = model(frame, conf=args.conf, verbose=False)[0]
+    inf_ms  = (time.time() - t0) * 1000
+
+    # Smooth FPS
+    fps = fps * 0.8 + 0.2 * (1000.0 / max(inf_ms, 1.0))
+
+    # Draw detections
+    annotated = results.plot()
+
+    # Overlay stats
+    n_det = len(results.boxes)
+    cv2.putText(annotated, f"FPS: {fps:.1f}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+    cv2.putText(annotated, f"Objects: {n_det}",
+                (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(annotated, f"Inf: {inf_ms:.0f}ms",
+                (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    cv2.imshow("YOLO Webcam — Q quit  S save", annotated)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('s'):
+        fname = f"webcam_{int(time.time())}.jpg"
+        cv2.imwrite(fname, annotated)
+        print(f"[INFO] Screenshot saved: {fname}")
+
+# Clean shutdown
+running = False
+thread.join(timeout=3)
+cv2.destroyAllWindows()
+import gc; gc.collect()
+import os; os._exit(0)
 ```
 
 **Run it:**
